@@ -1,0 +1,24 @@
+1 ICON "nada.ico"
+1 24 "Nada.manifest"
+
+1 VERSIONINFO
+FILEVERSION 1,1,0,0
+PRODUCTVERSION 1,1,0,0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "Nada - empty folder sweeper"
+      VALUE "ProductName", "Nada"
+      VALUE "InternalName", "Nada"
+      VALUE "OriginalFilename", "Nada.exe"
+      VALUE "FileVersion", "1.1.0.0"
+      VALUE "ProductVersion", "1.1.0.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END
