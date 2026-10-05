@@ -143,29 +143,3 @@ The configuration includes:
 - Custom folders to skip
 
 Changes to the skip configuration are applied to the next scan.
-
-## Installer
-
-The repository includes an **Inno Setup** script:
-
-```text
-Nada.iss
-```
-
-Build `Nada.exe` first, then compile the installer using Inno Setup.
-
-The installer can optionally create a desktop shortcut and provides a standard Windows uninstall entry.
-
-## Why "Nada"?
-
-Because sometimes the best directory is one that contains **nada**. 🧹
-
-## License
-
-Add your preferred license here, for example:
-
-```text
-MIT License
-```
-
-If this project is intended to be open source, adding a `LICENSE` file to the repository is recommended.
