@@ -15,6 +15,9 @@
 //    Skipped folders are never scanned, listed or deleted. Settings are
 //    remembered in %APPDATA%\Nada\settings.ini.
 //
+// * Folders holding only Thumbs.db / desktop.ini are treated as empty too (an option, on
+//   by default); those files are deleted together with the folder.
+//
 // Files in this project:
 //   Nada.cpp       this file
 //   Nada.rc        resources: icon, version info, manifest (themed controls + DPI)
@@ -64,7 +67,8 @@ enum {
     ID_OPT_PROG,
     ID_OPT_LIST,
     ID_OPT_ADD,
-    ID_OPT_REMOVE
+    ID_OPT_REMOVE,
+    ID_OPT_JUNK
 };
 
 enum WorkType { WORK_SCAN, WORK_DELETE };
@@ -113,6 +117,7 @@ static int S(int px) { return MulDiv(px, g_dpi, 96); }  // scale for DPI
 struct Settings {
     bool ignoreWindows = true;          // skip Windows system folders
     bool ignoreProgram = true;          // skip Program Files, ProgramData, AppData
+    bool ignoreJunk = true;             // treat Thumbs.db / desktop.ini as "not content"
     std::vector<std::wstring> custom;   // extra folders the user wants skipped
 };
 static Settings g_settings;
@@ -121,6 +126,7 @@ static Settings g_settings;
 // and only read by the worker.
 static std::vector<std::wstring> g_ignorePaths;   // exact folders to skip
 static bool g_skipDriveRootSystem = false;        // $Recycle.Bin, System Volume Information, ...
+static bool g_ignoreJunk = true;                  // folders holding only junk files count as empty
 static bool g_skipUsersAppData = false;           // <drive>\Users\<name>\AppData
 
 // Tidy a path for comparing: backslashes, no "." / ".." parts, no trailing slash.
@@ -169,6 +175,7 @@ static void LoadSettings()
 
     g_settings.ignoreWindows = GetPrivateProfileIntW(L"Skip", L"Windows", 1, ini.c_str()) != 0;
     g_settings.ignoreProgram = GetPrivateProfileIntW(L"Skip", L"Program", 1, ini.c_str()) != 0;
+    g_settings.ignoreJunk = GetPrivateProfileIntW(L"Skip", L"JunkFiles", 1, ini.c_str()) != 0;
 
     const int count = (int)GetPrivateProfileIntW(L"Skip", L"Count", 0, ini.c_str());
     g_settings.custom.clear();
@@ -191,6 +198,7 @@ static void SaveSettings()
 
     WritePrivateProfileStringW(L"Skip", L"Windows", g_settings.ignoreWindows ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"Skip", L"Program", g_settings.ignoreProgram ? L"1" : L"0", ini.c_str());
+    WritePrivateProfileStringW(L"Skip", L"JunkFiles", g_settings.ignoreJunk ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"Skip", L"Count", std::to_wstring(count).c_str(), ini.c_str());
 
     for (int i = 0; i < count; ++i) {
@@ -229,6 +237,7 @@ static void BuildIgnoreRules()
 
     g_skipDriveRootSystem = g_settings.ignoreWindows;
     g_skipUsersAppData = g_settings.ignoreProgram;
+    g_ignoreJunk = g_settings.ignoreJunk;
 }
 
 // True if this exact folder is on the skip list. Skipped folders are never
@@ -280,6 +289,52 @@ static bool IsIgnoredOrInside(const std::wstring& rootNorm)
 // Core logic (runs on the worker thread)
 // ---------------------------------------------------------------------------
 
+// Files that Windows creates on its own and that don't count as real content.
+static bool IsJunkName(const fs::path& p)
+{
+    static const wchar_t* const names[] = { L"Thumbs.db", L"desktop.ini" };
+    const std::wstring name = p.filename().native();
+    for (const wchar_t* n : names)
+        if (_wcsicmp(name.c_str(), n) == 0) return true;
+    return false;
+}
+
+// True for a plain file (not a directory or link) with a junk name.
+static bool IsJunkFile(const fs::directory_entry& e)
+{
+    std::error_code ec;
+    return IsJunkName(e.path()) && e.is_regular_file(ec) && !ec;
+}
+
+// Deletes a folder that was found empty. If junk files are ignored, the folder may still
+// hold Thumbs.db / desktop.ini: those are removed first (they are often hidden/system/
+// read-only, so the attributes are cleared). Anything else in the folder aborts the delete.
+static bool RemoveEmptyDir(const fs::path& dir)
+{
+    std::error_code ec;
+    if (g_ignoreJunk) {
+        std::vector<fs::path> junk;
+        {
+            fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec);
+            if (ec) return false;
+            for (const fs::directory_iterator end; it != end; it.increment(ec)) {
+                if (ec) return false;
+                std::error_code e2;
+                if (it->is_symlink(e2) || e2 || !IsJunkFile(*it)) return false;
+                junk.push_back(it->path());
+            }
+        }   // iterator closed before touching the folder itself
+        for (const auto& f : junk) {
+            SetFileAttributesW(f.c_str(), FILE_ATTRIBUTE_NORMAL);
+            if (!DeleteFileW(f.c_str())) return false;
+        }
+        const DWORD a = GetFileAttributesW(dir.c_str());   // folders with a desktop.ini are often read-only
+        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_READONLY))
+            SetFileAttributesW(dir.c_str(), a & ~(DWORD)FILE_ATTRIBUTE_READONLY);
+    }
+    return fs::remove(dir, ec) && !ec;
+}
+
 // Returns true if `dir` contains nothing except effectively-empty directories.
 // Every such non-root directory is appended to `out` in post-order (children
 // before parents) so deleting in list order always works.
@@ -309,6 +364,8 @@ static bool CollectEmpty(const fs::path& dir, std::vector<fs::path>& out, bool i
             if (IsIgnored(entry.path())) { hasContent = true; continue; }
             if (!CollectEmpty(entry.path(), out, false))
                 hasContent = true;
+        } else if (g_ignoreJunk && IsJunkFile(entry)) {
+            continue;   // Thumbs.db / desktop.ini don't make a folder non-empty
         } else {
             hasContent = true;
         }
@@ -343,7 +400,7 @@ static DWORD WINAPI WorkerProc(LPVOID param)
             if (g_effective[i]) { keep.push_back(i); continue; }
 
             std::error_code ec;
-            if (fs::remove(g_empty[i], ec) && !ec) {
+            if (RemoveEmptyDir(g_empty[i])) {
                 ++g_deleted;
             } else {
                 keep.push_back(i);
@@ -872,7 +929,7 @@ static void ShowListContextMenu(HWND hwnd, LPARAM lParam)
 // ---------------------------------------------------------------------------
 
 static struct OptState {
-    HWND dlg = nullptr, chkWin = nullptr, chkProg = nullptr, list = nullptr, btnRemove = nullptr;
+    HWND dlg = nullptr, chkWin = nullptr, chkProg = nullptr, chkJunk = nullptr, list = nullptr, btnRemove = nullptr;
     std::vector<std::wstring> custom;   // working copy of the custom skip list
     bool open = false, accepted = false;
 } g_opt;
@@ -903,23 +960,28 @@ static LRESULT CALLBACK OptionsProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             L"Skip program folders (Program Files, Program Files (x86), ProgramData, AppData)",
             BS_AUTOCHECKBOX | BS_MULTILINE | WS_TABSTOP, 0, ID_OPT_PROG, 16, 58, 438, 38);
 
-        make(L"STATIC", L"Also skip these folders:", SS_LEFT, 0, 0, 16, 108, 438, 18);
+        g_opt.chkJunk = make(L"BUTTON",
+            L"Ignore Thumbs.db and desktop.ini (folders containing only these count as empty "
+            L"and are deleted along with them)",
+            BS_AUTOCHECKBOX | BS_MULTILINE | WS_TABSTOP, 0, ID_OPT_JUNK, 16, 102, 438, 38);
+        make(L"STATIC", L"Also skip these folders:", SS_LEFT, 0, 0, 16, 152, 438, 18);
         g_opt.list = make(L"LISTBOX", L"", LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP,
-                          WS_EX_CLIENTEDGE, ID_OPT_LIST, 16, 130, 438, 140);
-        make(L"BUTTON", L"Add folder\u2026", BS_PUSHBUTTON | WS_TABSTOP, 0, ID_OPT_ADD, 16, 278, 120, 28);
+                          WS_EX_CLIENTEDGE, ID_OPT_LIST, 16, 174, 438, 140);
+        make(L"BUTTON", L"Add folder\u2026", BS_PUSHBUTTON | WS_TABSTOP, 0, ID_OPT_ADD, 16, 322, 120, 28);
         g_opt.btnRemove = make(L"BUTTON", L"Remove", BS_PUSHBUTTON | WS_TABSTOP | WS_DISABLED, 0,
-                               ID_OPT_REMOVE, 144, 278, 100, 28);
+                               ID_OPT_REMOVE, 144, 322, 100, 28);
 
         make(L"STATIC",
              L"Skipped folders are never scanned, listed or deleted. A folder that contains a skipped "
              L"folder is never treated as empty either.",
-             SS_LEFT, 0, 0, 16, 318, 438, 36);
+             SS_LEFT, 0, 0, 16, 362, 438, 36);
 
-        make(L"BUTTON", L"OK", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, IDOK, 266, 364, 90, 28);
-        make(L"BUTTON", L"Cancel", BS_PUSHBUTTON | WS_TABSTOP, 0, IDCANCEL, 364, 364, 90, 28);
+        make(L"BUTTON", L"OK", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, IDOK, 266, 408, 90, 28);
+        make(L"BUTTON", L"Cancel", BS_PUSHBUTTON | WS_TABSTOP, 0, IDCANCEL, 364, 408, 90, 28);
 
         SendMessageW(g_opt.chkWin, BM_SETCHECK, g_settings.ignoreWindows ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(g_opt.chkProg, BM_SETCHECK, g_settings.ignoreProgram ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g_opt.chkJunk, BM_SETCHECK, g_settings.ignoreJunk ? BST_CHECKED : BST_UNCHECKED, 0);
         for (const auto& c : g_opt.custom)
             SendMessageW(g_opt.list, LB_ADDSTRING, 0, (LPARAM)c.c_str());
         SendMessageW(g_opt.list, LB_SETHORIZONTALEXTENT, S(900), 0);
@@ -1001,7 +1063,7 @@ static void ShowOptions(HWND owner)
 
     const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     const DWORD ex = WS_EX_DLGMODALFRAME;
-    RECT rc = { 0, 0, S(470), S(404) };
+    RECT rc = { 0, 0, S(470), S(448) };
     AdjustWindowRectEx(&rc, style, FALSE, ex);
     const int w = rc.right - rc.left, h = rc.bottom - rc.top;
 
@@ -1034,6 +1096,7 @@ static void ShowOptions(HWND owner)
     if (g_opt.accepted) {  // read the controls before the window is destroyed
         g_settings.ignoreWindows = SendMessageW(g_opt.chkWin, BM_GETCHECK, 0, 0) == BST_CHECKED;
         g_settings.ignoreProgram = SendMessageW(g_opt.chkProg, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        g_settings.ignoreJunk = SendMessageW(g_opt.chkJunk, BM_GETCHECK, 0, 0) == BST_CHECKED;
         g_settings.custom = g_opt.custom;
         SaveSettings();
     }

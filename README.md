@@ -17,6 +17,7 @@ Built as a small, native **Win32 C++ application**, Nada is designed to be fast,
 - 🌳 **Automatic parent protection** — a parent folder containing a protected folder is automatically kept.
 - 📋 **Review before deletion** — results are displayed in a list before anything is removed.
 - 🖱️ **Multiple ways to protect folders** — use the button, context menu, double-click, or `Space`.
+- 🗑️ **Ignores junk files** — folders containing only `Thumbs.db` or `desktop.ini` count as empty and are removed (toggle in Options).
 - 🚫 **Configurable skip rules** — exclude Windows and program folders from scans.
 - 📁 **Custom skip list** — add your own directories that should never be scanned.
 - 💾 **Persistent settings** — preferences are stored in `%APPDATA%\Nada\settings.ini`.
@@ -141,5 +142,6 @@ The configuration includes:
 - Windows folder protection
 - Program folder protection
 - Custom folders to skip
+- Ignore `Thumbs.db` / `desktop.ini`
 
 Changes to the skip configuration are applied to the next scan.
